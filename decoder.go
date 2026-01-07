@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"time"
 
 	"golang.org/x/net/http2/hpack"
 )
@@ -136,6 +137,14 @@ type Decoder struct {
 
 	// maxTableCapacity is the maximum capacity we'll accept
 	maxTableCapacity uint64
+
+	// cond is used to signal when new entries are inserted into the dynamic table
+	// This allows the decoder to block until the required insert count is reached
+	cond *sync.Cond
+
+	// blockingTimeout is the maximum time to wait for encoder instructions
+	// Default is 5 seconds
+	blockingTimeout time.Duration
 }
 
 // DecodeFunc is a function that decodes the next header field from a header block.
@@ -146,18 +155,24 @@ type DecodeFunc func() (HeaderField, error)
 
 // NewDecoder returns a new Decoder with a dynamic table.
 func NewDecoder() *Decoder {
-	return &Decoder{
+	d := &Decoder{
 		dynamicTable:     NewDynamicTable(0),
 		maxTableCapacity: 65536, // Default max capacity
+		blockingTimeout:  5 * time.Second,
 	}
+	d.cond = sync.NewCond(&d.mu)
+	return d
 }
 
 // NewDecoderWithCapacity returns a new Decoder with the given max table capacity.
 func NewDecoderWithCapacity(maxCapacity uint64) *Decoder {
-	return &Decoder{
+	d := &Decoder{
 		dynamicTable:     NewDynamicTable(maxCapacity),
 		maxTableCapacity: maxCapacity,
+		blockingTimeout:  5 * time.Second,
 	}
+	d.cond = sync.NewCond(&d.mu)
+	return d
 }
 
 // SetDynamicTableCapacity processes a Set Dynamic Table Capacity instruction.
@@ -220,6 +235,7 @@ func (d *Decoder) Duplicate(relIndex uint64) error {
 
 // ProcessEncoderInstructions processes instructions from the encoder stream.
 // This should be called with data received on the encoder stream.
+// After processing, it broadcasts to wake any decoders waiting for entries.
 func (d *Decoder) ProcessEncoderInstructions(data []byte) error {
 	for len(data) > 0 {
 		b := data[0]
@@ -252,6 +268,9 @@ func (d *Decoder) ProcessEncoderInstructions(data []byte) error {
 			return err
 		}
 	}
+
+	// Broadcast to wake any decoders waiting for entries
+	d.cond.Broadcast()
 	return nil
 }
 
@@ -381,9 +400,8 @@ func (d *Decoder) Decode(p []byte) DecodeFunc {
 				base = 0
 			} else {
 				// Decode per RFC 9204 Section 4.5.1.1
-				d.mu.RLock()
+				d.mu.Lock()
 				insertCount := d.dynamicTable.InsertCount()
-				d.mu.RUnlock()
 
 				maxEntries := d.maxTableCapacity / 32
 				if maxEntries == 0 {
@@ -391,6 +409,7 @@ func (d *Decoder) Decode(p []byte) DecodeFunc {
 				}
 				fullRange := 2 * maxEntries
 				if encodedInsertCount > fullRange {
+					d.mu.Unlock()
 					return HeaderField{}, errors.New("invalid encoded insert count")
 				}
 
@@ -401,15 +420,33 @@ func (d *Decoder) Decode(p []byte) DecodeFunc {
 				// Handle wrap-around
 				if requiredInsertCount > maxValue {
 					if requiredInsertCount <= fullRange {
+						d.mu.Unlock()
 						return HeaderField{}, errors.New("invalid required insert count")
 					}
 					requiredInsertCount -= fullRange
 				}
 
-				// Check if we have enough entries
-				if requiredInsertCount > insertCount {
-					return HeaderField{}, fmt.Errorf("required insert count %d exceeds current %d", requiredInsertCount, insertCount)
+				// Wait for encoder stream to provide required entries (RFC 9204 Section 2.1.2)
+				// Block until requiredInsertCount <= insertCount or timeout
+				deadline := time.Now().Add(d.blockingTimeout)
+				for requiredInsertCount > d.dynamicTable.InsertCount() {
+					if time.Now().After(deadline) {
+						currentCount := d.dynamicTable.InsertCount()
+						d.mu.Unlock()
+						return HeaderField{}, fmt.Errorf("timeout waiting for encoder stream: required insert count %d exceeds current %d", requiredInsertCount, currentCount)
+					}
+					// Wait for signal from ProcessEncoderInstructions
+					// Use a timed wait by spawning a goroutine that will broadcast after a short interval
+					done := make(chan struct{})
+					go func() {
+						time.Sleep(10 * time.Millisecond)
+						d.cond.Broadcast()
+						close(done)
+					}()
+					d.cond.Wait()
+					<-done
 				}
+				d.mu.Unlock()
 
 				// Set base for post-base references
 				base = requiredInsertCount
