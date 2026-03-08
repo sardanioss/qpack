@@ -33,18 +33,21 @@ func (e *Encoder) WriteField(f HeaderField) error {
 
 	idxAndVals, nameFound := encoderMap[f.Name]
 	if nameFound {
-		if idxAndVals.values == nil {
+		if f.Sensitive {
+			// Sensitive headers must use literal encoding with N=1 (never index)
+			e.writeLiteralFieldWithNameReference(&f, idxAndVals.idx, true)
+		} else if idxAndVals.values == nil {
 			if len(f.Value) == 0 {
 				e.writeIndexedField(idxAndVals.idx)
 			} else {
-				e.writeLiteralFieldWithNameReference(&f, idxAndVals.idx)
+				e.writeLiteralFieldWithNameReference(&f, idxAndVals.idx, false)
 			}
 		} else {
 			valIdx, valueFound := idxAndVals.values[f.Value]
 			if valueFound {
 				e.writeIndexedField(valIdx)
 			} else {
-				e.writeLiteralFieldWithNameReference(&f, idxAndVals.idx)
+				e.writeLiteralFieldWithNameReference(&f, idxAndVals.idx, false)
 			}
 		}
 	} else {
@@ -66,7 +69,12 @@ func (e *Encoder) Close() error {
 func (e *Encoder) writeLiteralFieldWithoutNameReference(f HeaderField) {
 	offset := len(e.buf)
 	e.buf = appendVarInt(e.buf, 3, hpack.HuffmanEncodeLength(f.Name))
-	e.buf[offset] ^= 0x20 ^ 0x8
+	// 001NHXXX: N=never-index, H=1 (Huffman)
+	if f.Sensitive {
+		e.buf[offset] ^= 0x20 ^ 0x10 ^ 0x8 // N=1, H=1
+	} else {
+		e.buf[offset] ^= 0x20 ^ 0x8 // N=0, H=1
+	}
 	e.buf = hpack.AppendHuffmanString(e.buf, f.Name)
 	offset = len(e.buf)
 	e.buf = appendVarInt(e.buf, 7, hpack.HuffmanEncodeLength(f.Value))
@@ -75,11 +83,15 @@ func (e *Encoder) writeLiteralFieldWithoutNameReference(f HeaderField) {
 }
 
 // Encodes a header field whose name is present in one of the tables.
-func (e *Encoder) writeLiteralFieldWithNameReference(f *HeaderField, id uint8) {
+func (e *Encoder) writeLiteralFieldWithNameReference(f *HeaderField, id uint8, neverIndex bool) {
 	offset := len(e.buf)
 	e.buf = appendVarInt(e.buf, 4, uint64(id))
-	// Set the 01NTxxxx pattern, forcing N to 0 and T to 1
-	e.buf[offset] ^= 0x50
+	// 01NTxxxx: N=never-index, T=1 (static table)
+	if neverIndex {
+		e.buf[offset] ^= 0x70 // N=1, T=1
+	} else {
+		e.buf[offset] ^= 0x50 // N=0, T=1
+	}
 	offset = len(e.buf)
 	e.buf = appendVarInt(e.buf, 7, hpack.HuffmanEncodeLength(f.Value))
 	e.buf[offset] ^= 0x80
